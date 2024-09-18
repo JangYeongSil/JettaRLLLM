@@ -1,0 +1,200 @@
+import math
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import logging
+from collections import Counter
+from torch.nn.utils.rnn import pad_sequence
+from sklearn.model_selection import train_test_split
+import pickle
+
+# Basic configuration for logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants and Hyperparameters
+folder_directory = "/kaggle/input/primele15celemaimari"
+learning_rate = 1e-3
+num_epochs = 1000
+batch_size = 256
+max_seq_length = 32
+dropout_rate = 0.9
+weight_decay = 0.01
+
+# Define device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Initial model parameters
+initial_vocab_size = 5010
+max_vocab_size = 10000
+initial_embedding_dim = 128
+initial_hidden_dim = 64
+initial_num_layers = 64
+initial_num_heads = 64
+initial_ffn_dim = 128
+
+class HybridBrainModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers, num_heads, ffn_dim, dropout_rate):
+        super(HybridBrainModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.transformer_layers = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(embedding_dim, num_heads, ffn_dim, dropout_rate, batch_first=True),
+            num_layers
+        )
+        self.fc = nn.Linear(embedding_dim, vocab_size)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.transformer_layers(x)
+        logits = self.fc(x)
+        return logits, x  # Return both logits and transformer output
+
+class ReinforcementLearningModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers, num_heads, ffn_dim, dropout_rate):
+        super(ReinforcementLearningModel, self).__init__()
+        self.actor = HybridBrainModel(vocab_size, embedding_dim, hidden_dim, num_layers, num_heads, ffn_dim, dropout_rate)
+        self.critic = nn.Linear(embedding_dim, 1)
+
+    def forward(self, x):
+        logits, actor_output = self.actor(x)
+        value = self.critic(actor_output)
+        return logits, value.squeeze(-1)
+
+def calculate_actor_loss(logits, targets):
+    loss_fn = nn.CrossEntropyLoss()
+    return loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+def calculate_critic_loss(value, targets):
+    # Using a simple mean squared error for the entire sequence
+    loss_fn = nn.MSELoss()
+    return loss_fn(value, targets.float())
+
+def calculate_accuracy(logits, targets):
+    # Get the predictions by finding the index of the max logit value (this represents the predicted class)
+    predictions = torch.argmax(logits, dim=-1)
+    correct_predictions = (predictions == targets).float()
+
+    # Calculate the average accuracy for the batch
+    accuracy = correct_predictions.mean().item()
+    return accuracy
+
+def train_reinforcement_model(model, optimizer, train_loader, val_loader, num_epochs):
+    model.train()
+    for epoch in range(num_epochs):
+        total_train_loss = 0
+        total_train_accuracy = 0
+
+        # Training loop
+        for batch in train_loader:
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+
+            logits, value = model(inputs)
+
+            loss_actor = calculate_actor_loss(logits, targets)
+            loss_critic = calculate_critic_loss(value, targets)
+
+            loss = loss_actor + loss_critic
+            loss.backward()
+            optimizer.step()
+
+            # Track loss and accuracy
+            total_train_loss += loss.item()
+            total_train_accuracy += calculate_accuracy(logits, targets)
+
+        # Calculate average train loss and accuracy
+        avg_train_loss = total_train_loss / len(train_loader)
+        train_accuracy = total_train_accuracy / len(train_loader)
+
+        # Validation loop
+        model.eval()  # Set model to evaluation mode
+        total_val_loss = 0
+        total_val_accuracy = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs, targets = batch
+                inputs, targets = inputs.to(device), targets.to(device)
+
+                logits, value = model(inputs)
+
+                loss_actor = calculate_actor_loss(logits, targets)
+                loss_critic = calculate_critic_loss(value, targets)
+
+                loss = loss_actor + loss_critic
+                total_val_loss += loss.item()
+                total_val_accuracy += calculate_accuracy(logits, targets)
+
+        # Calculate average val loss and accuracy
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_accuracy = total_val_accuracy / len(val_loader)
+
+        # Print epoch statistics
+        print(f'Epoch {epoch+1}/{num_epochs}, '
+              f'Train Loss: {avg_train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, '
+              f'Val Loss: {avg_val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
+        
+        model.train()  # Switch back to training mode after validation
+
+def preprocess_documents(filenames, folder_directory, max_vocab_size):
+    all_tokens = []
+    vocab = Counter()
+
+    for filename in filenames:
+        file_path = os.path.join(folder_directory, filename)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        tokens = text.split()
+        all_tokens.extend(tokens)
+        vocab.update(tokens)
+
+    # Create vocabulary
+    vocab = {word: i + 1 for i, (word, _) in enumerate(vocab.most_common(max_vocab_size - 1))}
+    vocab['<unk>'] = 0  # Add unknown token
+
+    # Convert tokens to indices
+    all_indices = [[vocab.get(token, 0) for token in all_tokens]]
+
+    return all_indices, vocab
+
+def create_dataset(indices, chunk_size):
+    dataset = []
+    for seq in indices:
+        for i in range(0, len(seq) - chunk_size, chunk_size):
+            input_seq = torch.tensor(seq[i:i+chunk_size], dtype=torch.long)
+            target_seq = torch.tensor(seq[i+1:i+chunk_size+1], dtype=torch.long)
+            dataset.append((input_seq, target_seq))
+    return dataset
+
+def collate_fn(batch):
+    inputs, targets = zip(*batch)
+    inputs_padded = pad_sequence(inputs, batch_first=True, padding_value=0)
+    targets_padded = pad_sequence(targets, batch_first=True, padding_value=0)
+    return inputs_padded, targets_padded
+
+# Main execution
+if __name__ == "__main__":
+    filenames = ["/kaggle/input/primele15celemaimari/Alexandre_Dumas-Muschetarii_V3-Vicontele_De_Bragelonne_2.0_10__.txt"]  # Add more filenames if needed
+    all_indices, vocab = preprocess_documents(filenames, folder_directory, max_vocab_size)
+    vocab_size = len(vocab)
+
+    dataset = create_dataset(all_indices, chunk_size=max_seq_length)
+    train_data, val_data = train_test_split(dataset, test_size=0.2, random_state=42)
+
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_data, batch_size=batch_size, collate_fn=collate_fn)
+
+    model = ReinforcementLearningModel(vocab_size, initial_embedding_dim, initial_hidden_dim, 
+                                        initial_num_layers, initial_num_heads, initial_ffn_dim, dropout_rate).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    # Start training
+    train_reinforcement_model(model, optimizer, train_loader, val_loader, num_epochs)
+
+    # Save the model
+    torch.save(model.state_dict(), 'reinforcement_model.pth')
+    logging.info("Training completed and model saved.")
+    
+    # Save the vocabulary
+    with open('vocab.pkl', 'wb') as f:
+        pickle.dump(vocab, f)

@@ -1,0 +1,251 @@
+import os
+import torch
+import torch.nn as nn
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.utils.utils as xu
+from torch.utils.data import Dataset, DataLoader
+import logging
+from collections import Counter
+from torch.nn.utils.rnn import pad_sequence
+from sklearn.model_selection import train_test_split
+import pickle
+from transformers import get_linear_schedule_with_warmup
+from torch.nn.utils import clip_grad_norm_
+from tokenizers import Tokenizer
+from tokenizers.models import WordPiece
+from tokenizers.trainers import WordPieceTrainer
+from tokenizers.pre_tokenizers import Whitespace
+
+# Basic configuration for logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants and Hyperparameters
+folder_directory = "/kaggle/input/tiny-stories-dataset"
+learning_rate = 1e-3
+num_epochs = 10
+batch_size = 16
+max_seq_length = 128
+dropout_rate = 0.2
+weight_decay = 0.01
+grad_clip = 1.0
+warmup_steps = 1000
+
+# Initial model parameters
+initial_vocab_size = 2000
+max_vocab_size = 2000
+initial_embedding_dim = 64
+initial_hidden_dim = 64
+initial_num_layers = 32
+initial_num_heads = 32
+initial_ffn_dim = 64
+
+class HybridBrainModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers, num_heads, ffn_dim, dropout_rate):
+        super(HybridBrainModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.transformer_layers = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(embedding_dim, num_heads, ffn_dim, dropout_rate, batch_first=True),
+            num_layers
+        )
+        self.fc = nn.Linear(embedding_dim, vocab_size)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.transformer_layers(x)
+        logits = self.fc(x)
+        return logits, x  # Return both logits and transformer output
+
+class ReinforcementLearningModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers, num_heads, ffn_dim, dropout_rate):
+        super(ReinforcementLearningModel, self).__init__()
+        self.actor = HybridBrainModel(vocab_size, embedding_dim, hidden_dim, num_layers, num_heads, ffn_dim, dropout_rate)
+        self.critic = nn.Linear(embedding_dim, 1)
+
+    def forward(self, x):
+        logits, actor_output = self.actor(x)
+        value = self.critic(actor_output)
+        return logits, value.squeeze(-1)
+
+def calculate_actor_loss(logits, targets):
+    loss_fn = nn.CrossEntropyLoss()
+    return loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+def calculate_critic_loss(value, targets):
+    loss_fn = nn.MSELoss()
+    return loss_fn(value, targets.float())
+
+def calculate_accuracy(logits, targets):
+    predictions = torch.argmax(logits, dim=-1)
+    correct_predictions = (predictions == targets).float()
+    accuracy = correct_predictions.mean().item()
+    return accuracy
+
+def train_tokenizer(filenames, folder_directory, vocab_size):
+    tokenizer = Tokenizer(WordPiece(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    trainer = WordPieceTrainer(vocab_size=vocab_size, special_tokens=["[UNK]", "[PAD]"])
+
+    def batch_iterator():
+        for filename in filenames:
+            file_path = os.path.join(folder_directory, filename)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                yield f.read()
+
+    tokenizer.train_from_iterator(batch_iterator(), trainer=trainer)
+    return tokenizer
+
+def preprocess_documents(tokenizer, filenames, folder_directory):
+    all_tokens = []
+
+    for filename in filenames:
+        file_path = os.path.join(folder_directory, filename)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        encoded = tokenizer.encode(text)
+        all_tokens.extend(encoded.ids)
+
+    return [all_tokens]
+
+def create_dataset(indices, chunk_size):
+    dataset = []
+    for seq in indices:
+        for i in range(0, len(seq) - chunk_size, chunk_size):
+            input_seq = torch.tensor(seq[i:i+chunk_size], dtype=torch.long)
+            target_seq = torch.tensor(seq[i+1:i+chunk_size+1], dtype=torch.long)
+            dataset.append((input_seq, target_seq))
+    return dataset
+
+def collate_fn(batch):
+    inputs, targets = zip(*batch)
+    inputs_padded = pad_sequence(inputs, batch_first=True, padding_value=0)
+    targets_padded = pad_sequence(targets, batch_first=True, padding_value=0)
+    return inputs_padded, targets_padded
+
+def print_model_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f'Total parameters: {total_params}')
+    print(f'Trainable parameters: {trainable_params}')
+
+def train_reinforcement_model_loop(model, optimizer, scheduler, train_loader, val_loader, num_epochs, device):
+    model.train()
+    best_val_loss = float('inf')
+    for epoch in range(num_epochs):
+        total_train_loss = 0
+        total_train_accuracy = 0
+
+        # Training loop
+        for batch in train_loader:
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+
+            logits, value = model(inputs)
+
+            loss_actor = calculate_actor_loss(logits, targets)
+            loss_critic = calculate_critic_loss(value, targets)
+
+            loss = loss_actor + loss_critic
+            loss.backward()
+            
+            # Gradient clipping
+            clip_grad_norm_(model.parameters(), grad_clip)
+            
+            xm.optimizer_step(optimizer)
+            scheduler.step()
+
+            total_train_loss += loss.item()
+            total_train_accuracy += calculate_accuracy(logits, targets)
+
+        avg_train_loss = total_train_loss / len(train_loader)
+        train_accuracy = total_train_accuracy / len(train_loader)
+
+        # Validation loop
+        model.eval()
+        total_val_loss = 0
+        total_val_accuracy = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs, targets = batch
+                inputs, targets = inputs.to(device), targets.to(device)
+
+                logits, value = model(inputs)
+
+                loss_actor = calculate_actor_loss(logits, targets)
+                loss_critic = calculate_critic_loss(value, targets)
+
+                loss = loss_actor + loss_critic
+                total_val_loss += loss.item()
+                total_val_accuracy += calculate_accuracy(logits, targets)
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_accuracy = total_val_accuracy / len(val_loader)
+
+        # Print epoch statistics
+        print(f'Epoch {epoch+1}/{num_epochs}, '
+              f'Train Loss: {avg_train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, '
+              f'Val Loss: {avg_val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
+        
+        # Save the best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            xm.save(model.state_dict(), 'best_model.pth')
+            print(f"New best model saved with validation loss: {best_val_loss:.4f}")
+        
+        model.train()
+
+def train_reinforcement_model(index):
+    # Set up TPU-specific environment variables
+    os.environ['XLA_USE_BF16'] = '1'
+    os.environ['XLA_TENSOR_ALLOCATOR_MAXSIZE'] = '100000000'
+
+    # Initialize the TPU system
+    xm.rendezvous('init')
+    xm.mark_step()
+
+    # Get the TPU device
+    device = xm.xla_device()
+    
+    # Rest of your training setup...
+    filenames = [f for f in os.listdir(folder_directory) if os.path.isfile(os.path.join(folder_directory, f))]
+    
+    # Train tokenizer
+    tokenizer = train_tokenizer(filenames, folder_directory, max_vocab_size)
+    
+    # Preprocess documents
+    all_indices = preprocess_documents(tokenizer, filenames, folder_directory)
+    vocab_size = tokenizer.get_vocab_size()
+
+    dataset = create_dataset(all_indices, chunk_size=max_seq_length)
+    train_data, val_data = train_test_split(dataset, test_size=0.2, random_state=42)
+
+    # Adjust batch size based on the number of TPU cores
+    global_batch_size = batch_size * xm.xrt_world_size()
+    per_core_batch_size = global_batch_size // xm.xrt_world_size()
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_data,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=True
+    )
+    train_loader = DataLoader(train_data, batch_size=per_core_batch_size, sampler=train_sampler, collate_fn=collate_fn)
+    val_loader = DataLoader(val_data, batch_size=per_core_batch_size, collate_fn=collate_fn)
+
+    # Initialize model, optimizer, and scheduler
+    model = ReinforcementLearningModel(vocab_size, initial_embedding_dim, initial_hidden_dim, initial_num_layers, initial_num_heads, initial_ffn_dim, dropout_rate).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=len(train_loader) * num_epochs)
+
+    # Print model parameters
+    print_model_parameters(model)
+
+    # Train model
+    train_reinforcement_model_loop(model, optimizer, scheduler, train_loader, val_loader, num_epochs, device)
+
+if __name__ == '__main__':
+    xmp.spawn(train_reinforcement_model, nprocs=1, start_method='fork')  # Adjust nprocs based on TPU cores
