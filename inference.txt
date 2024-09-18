@@ -1,3 +1,7 @@
+# IMPORTANT NOTICE : IF THIS DOESN'T WORK USE THE OTHER INFERENCE FILE CODE .
+
+
+
 def generate_text(model, start_text, token_to_idx, idx_to_token, max_length=50):
     model.eval()
     # Preprocess the input text
